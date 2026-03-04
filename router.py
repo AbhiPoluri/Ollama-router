@@ -7,6 +7,9 @@ Dashboard: http://localhost:4002
 """
 
 import re
+import json
+import uuid
+import time
 import threading
 from collections import deque, defaultdict
 from datetime import datetime
@@ -346,6 +349,120 @@ async def api_generate(request: Request):
         async with httpx.AsyncClient(timeout=300) as client:
             r = await client.post(f"{OLLAMA_BASE}/api/generate", json=body)
             return JSONResponse(r.json())
+
+# ── Anthropic-compatible /v1/messages endpoint ────────────────────────────────
+
+@proxy.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """
+    Anthropic Messages API → Ollama /v1/chat/completions bridge.
+    Accepts: POST /v1/messages with Anthropic-format body.
+    Returns: Anthropic-format response (streaming or not).
+    """
+    body = await request.json()
+
+    # ── Convert Anthropic → OpenAI format ────────────────────────────────────
+    oai_messages = []
+    if system := body.get("system"):
+        oai_messages.append({"role": "system", "content": system})
+
+    for msg in body.get("messages", []):
+        role    = msg.get("role", "user")
+        content = msg.get("content", "")
+        # Anthropic content can be a list of blocks
+        if isinstance(content, list):
+            content = " ".join(
+                block.get("text", "") for block in content
+                if block.get("type") == "text"
+            )
+        oai_messages.append({"role": role, "content": content})
+
+    # Route based on messages
+    model, reason = score_prompt(oai_messages)
+    lane = "smart" if model == state["smart_model"] else "fast"
+    state["counts"][model] += 1
+
+    preview = oai_messages[-1].get("content", "")[:300] if oai_messages else ""
+    state["history"].appendleft({
+        "time":    datetime.now().strftime("%H:%M:%S"),
+        "model":   model,
+        "lane":    lane,
+        "reason":  reason,
+        "preview": preview,
+    })
+
+    oai_body = {
+        "model":       model,
+        "messages":    oai_messages,
+        "max_tokens":  body.get("max_tokens", 4096),
+        "temperature": body.get("temperature", 0.7),
+        "stream":      body.get("stream", False),
+    }
+    if model == state["smart_model"]:
+        oai_body["think"] = False
+
+    stream = oai_body["stream"]
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if stream:
+        # ── Streaming: convert OpenAI SSE → Anthropic SSE ────────────────────
+        async def _stream_anthropic():
+            # Send message_start
+            yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','content':[],'model':model,'stop_reason':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
+            yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+            yield "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+            client = httpx.AsyncClient(timeout=300)
+            try:
+                async with client.stream(
+                    "POST", f"{OLLAMA_BASE}/v1/chat/completions",
+                    json=oai_body, headers={"Content-Type": "application/json"},
+                ) as r:
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            delta = chunk["choices"][0].get("delta", {})
+                            text  = delta.get("content", "")
+                            if text:
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})}\n\n"
+                        except Exception:
+                            pass
+            finally:
+                await client.aclose()
+
+            yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+            yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':0}})}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+
+        return StreamingResponse(_stream_anthropic(), media_type="text/event-stream")
+
+    else:
+        # ── Non-streaming: call Ollama, wrap in Anthropic response format ─────
+        async with httpx.AsyncClient(timeout=300) as client:
+            r   = await client.post(f"{OLLAMA_BASE}/v1/chat/completions", json=oai_body)
+            oai = r.json()
+
+        text = oai.get("choices", [{}])[0].get("message", {}).get("content", "")
+        usage = oai.get("usage", {})
+        return JSONResponse({
+            "id":           msg_id,
+            "type":         "message",
+            "role":         "assistant",
+            "content":      [{"type": "text", "text": text}],
+            "model":        model,
+            "stop_reason":  "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens":  usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+            },
+        })
+
 
 @proxy.get("/stats")
 async def get_stats():
