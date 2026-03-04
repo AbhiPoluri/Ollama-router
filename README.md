@@ -47,7 +47,7 @@ The router scores only your **last user message** (not the full context) to avoi
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ollama-router
+git clone https://github.com/AbhiPoluri/ollama-router
 cd ollama-router
 python3 -m venv venv
 source venv/bin/activate
